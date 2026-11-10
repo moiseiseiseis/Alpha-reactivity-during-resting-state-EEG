@@ -1,0 +1,25 @@
+# Datos del registro: viven en Drive (alfa-eeg-data/), nunca en el repo
+*.eeg
+*.vhdr
+*.vmrk
+*.edf
+*.fif
+data/
+
+# Resultados y figuras: también van a Drive
+*.png
+*.csv
+!docs/**/*.png
+
+# Python / Jupyter
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
+venv/
+.env
+
+# Sistema
+.DS_Store
+Thumbs.db
+desktop.ini
