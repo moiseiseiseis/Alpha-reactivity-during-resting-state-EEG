@@ -8,7 +8,8 @@
 2. Abre el notebook desde GitHub en Colab: `colab.research.google.com/github/moiseiseiseis/Alpha-reactivity-during-resting-state-EEG/blob/main/notebooks/<notebook>.ipynb`.
 3. Corre la primera celda: monta Drive, clona el repo e instala `mne`.
 4. En local: `pip install -r requirements.txt`, pon los archivos del registro en `data/datos/` (o define `ALFA_DATA`) y abre `notebooks/` con Jupyter.
-5. Todos los parámetros están en `CONFIG` de [`src/alfa.py`](src/alfa.py). Para probar variantes usa `alfa.variante(ventana_s=10.0)`.
+5. Pruebas de `alfa.py` (no necesitan el registro): `python -m pytest -q`.
+6. Todos los parámetros están en `CONFIG` de [`src/alfa.py`](src/alfa.py). Para probar variantes usa `alfa.variante(ventana_s=10.0)`.
 
 ## Estructura
 

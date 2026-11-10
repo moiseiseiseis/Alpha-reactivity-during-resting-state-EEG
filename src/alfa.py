@@ -119,20 +119,102 @@ def guardar_figura(fig, nombre: str, dpi: int = 200) -> Path:
 # Carril A · Inspección y calidad (Moisés)
 # ---------------------------------------------------------------------------
 
-def cargar_raw(ruta_vhdr=None, preload: bool = True) -> mne.io.Raw:
-    """Carga el registro BrainVision con VEOG como 'eog' y unidades verificadas.
+# Marcadores del registro. MNE lee el .vmrk ("Stimulus/S  3"); el events.tsv de
+# BIDS usa otros nombres para los mismos eventos ("Stimulus/S200"):
+#   .vmrk   events.tsv                   significado
+#   S  1    Comment/no USB Connection    inicio del archivo (muestra 1)
+#   S  2    Stimulus/S  1                cambio de bloque (~10 ms antes del bloque)
+#   S  3    Stimulus/S200                ojos abiertos (EO), se repite cada 2 s
+#   S  4    Stimulus/S210                ojos cerrados (EC), se repite cada 2 s
+# El .vmrk cuenta muestras desde 1 y el .tsv desde 0 (una muestra de diferencia).
+MARCADORES_CONDICION = {
+    "Stimulus/S  3": "EO", "Stimulus/S200": "EO",
+    "Stimulus/S  4": "EC", "Stimulus/S210": "EC",
+}
+MARCADOR_CAMBIO = "Stimulus/S  2"
 
-    Pendiente (A, rama a/inspeccion).
+_UNIDADES_MICRO = {"µV", "μV", "uV"}  # µ (micro) y μ (letra griega mu)
+
+
+def cargar_raw(ruta_vhdr=None, preload: bool = True) -> mne.io.Raw:
+    """Carga el registro BrainVision listo para usar.
+
+    - VEOG queda como canal 'eog' (MNE lo carga como EEG; channels.tsv dice EOG).
+    - Verifica que el archivo declare µV en todos los canales. MNE convierte a
+      voltios: ``raw.get_data()`` está en V; multiplicar por 1e6 para µV.
+    - Agrega posiciones 10-05 estándar (para topografías y para ubicar canales).
+    - ``info['line_freq'] = 50`` (PowerLineFrequency del eeg.json).
+
+    ``preload=True`` ocupa ~1.2 GB (62 canales × 2.555 M muestras en float64).
+    Con ``preload=False`` se lee del disco bajo demanda; ``raw.pick(...)`` y
+    luego ``raw.load_data()`` reduce la memoria si solo se usan pocos canales.
     """
-    raise NotImplementedError("A: cargar_raw() pendiente")
+    ruta_vhdr = Path(ruta_vhdr) if ruta_vhdr is not None else rutas()["vhdr"]
+    if not ruta_vhdr.exists():
+        raise FileNotFoundError(
+            f"No se encontró {ruta_vhdr}. ¿Está montado Drive y existe alfa-eeg-data/datos/?"
+        )
+    raw = mne.io.read_raw_brainvision(ruta_vhdr, preload=preload, verbose="ERROR")
+
+    unidades = getattr(raw, "_orig_units", {}) or {}
+    raras = {ch: u for ch, u in unidades.items() if u not in _UNIDADES_MICRO}
+    if raras:
+        raise ValueError(f"Canales con unidades distintas de µV: {raras}")
+
+    if "VEOG" in raw.ch_names:
+        raw.set_channel_types({"VEOG": "eog"})
+    raw.set_montage("standard_1005", on_missing="warn", verbose="ERROR")
+    raw.info["line_freq"] = 50.0
+    return raw
 
 
 def tabla_bloques(raw: mne.io.Raw) -> pd.DataFrame:
-    """Una fila por bloque: bloque, condicion ('EO'/'EC'), inicio_s, fin_s.
+    """Una fila por bloque de condición, a partir de los marcadores repetidos.
 
-    Pendiente (A, rama a/inspeccion).
+    Un bloque es una racha de marcadores de condición iguales y consecutivos
+    (los ``S  2`` y ``S  1`` no cortan la racha).
+
+    Columnas:
+        bloque        1..16, en orden temporal
+        condicion     'EO' (ojos abiertos) o 'EC' (ojos cerrados)
+        inicio_s      primer marcador de la racha
+        fin_s         último marcador + separación típica entre marcadores (2 s)
+        duracion_s    fin_s - inicio_s
+        n_marcadores  marcadores de condición en el bloque (30 en este registro)
+        cambio_s      ``S  2`` más cercano antes del bloque (NaN si no hay)
+
+    Los huecos entre ``fin_s`` de un bloque e ``inicio_s`` del siguiente
+    (1.6–2.6 s en este registro) y los ~25 s finales después del último
+    bloque no pertenecen a ninguna condición.
     """
-    raise NotImplementedError("A: tabla_bloques() pendiente")
+    ann = raw.annotations
+    eventos = pd.DataFrame({"t": ann.onset, "desc": ann.description})
+    cambios = eventos.loc[eventos["desc"] == MARCADOR_CAMBIO, "t"].to_numpy()
+
+    cond = eventos[eventos["desc"].isin(MARCADORES_CONDICION)].copy()
+    if cond.empty:
+        raise ValueError("No hay marcadores de condición (S 3/S 4 o S200/S210) en raw.annotations")
+    cond["condicion"] = cond["desc"].map(MARCADORES_CONDICION)
+    cond = cond.sort_values("t").reset_index(drop=True)
+    cond["racha"] = (cond["condicion"] != cond["condicion"].shift()).cumsum()
+
+    paso = cond.groupby("racha")["t"].diff().median()  # separación típica (2 s)
+
+    filas = []
+    for i, (_, g) in enumerate(cond.groupby("racha"), start=1):
+        inicio = float(g["t"].iloc[0])
+        fin = min(float(g["t"].iloc[-1] + paso), raw.times[-1])
+        previos = cambios[cambios <= inicio]
+        filas.append({
+            "bloque": i,
+            "condicion": g["condicion"].iloc[0],
+            "inicio_s": inicio,
+            "fin_s": fin,
+            "duracion_s": fin - inicio,
+            "n_marcadores": len(g),
+            "cambio_s": float(previos[-1]) if len(previos) else float("nan"),
+        })
+    return pd.DataFrame(filas)
 
 
 def marcar_artefactos(raw: mne.io.Raw, cfg: dict | None = None) -> mne.io.Raw:
