@@ -159,18 +159,99 @@ def acondicionar(raw: mne.io.Raw, cfg: dict | None = None) -> mne.io.Raw:
 # Carril C · Caracterización del alfa (Diego)
 # ---------------------------------------------------------------------------
 
-def potencia_alfa(raw: mne.io.Raw, bloques: pd.DataFrame, cfg: dict | None = None) -> pd.DataFrame:
-    """Potencia alfa por ventana y canal (PSD de Welch).
+import numpy as np
+from numpy.lib.stride_tricks import sliding_window_view
+from scipy.integrate import trapezoid
+from scipy.signal import welch
 
-    Columnas: t_s, bloque, condicion, canal, alfa_abs, alfa_rel.
-    Pendiente (C).
+def potencia_alfa(raw: mne.io.Raw, bloques: pd.DataFrame, cfg: dict | None = None) -> pd.DataFrame:
+    """Potencia alfa por ventana deslizante y canal (PSD de Welch, un segmento por ventana).
+
+    Ventanas de ``cfg['ventana_s']`` con traslape ``cfg['solapamiento']`` sobre todo el
+    registro (también transiciones, para la curva temporal).
+
+    Columnas:
+        t_s        centro de la ventana (s)
+        bloque     bloque al que pertenece el centro (NA fuera de bloques)
+        condicion  'EO' / 'EC' (None fuera de bloques)
+        canal      nombre del canal (cfg['canales'])
+        alfa_abs   potencia en cfg['banda_alfa'] (µV², área bajo la PSD)
+        alfa_rel   alfa_abs / potencia en la banda del filtro (l_freq–h_freq)
+        dentro     True si la ventana cae completa en [inicio + recorte, fin] de un bloque
+
+    Si ``cfg['excluir_artefactos']``, se descartan las ventanas que se traslapan con
+    anotaciones 'BAD_...'.
     """
-    raise NotImplementedError("C: potencia_alfa() pendiente")
+    cfg = CONFIG if cfg is None else cfg
+    sf = raw.info["sfreq"]
+    canales = cfg["canales"]
+    n_win = int(round(cfg["ventana_s"] * sf))
+    paso = max(1, int(round(n_win * (1 - cfg["solapamiento"]))))
+
+    x = raw.get_data(picks=canales) * 1e6                          # V → µV
+    seg = sliding_window_view(x, n_win, axis=1)[:, ::paso, :]       # (canales, ventanas, muestras)
+    t_ini = np.arange(seg.shape[1]) * paso / sf
+    t_fin = t_ini + n_win / sf
+    t_c = (t_ini + t_fin) / 2
+
+    f, pxx = welch(seg, fs=sf, nperseg=n_win, axis=-1)              # µV²/Hz
+    a, b = cfg["banda_alfa"]
+    lo = cfg["filtro"].get("l_freq") or f[1]
+    hi = cfg["filtro"].get("h_freq") or sf / 2
+    m_a, m_t = (f >= a) & (f <= b), (f >= lo) & (f <= hi)
+    alfa_abs = trapezoid(pxx[..., m_a], f[m_a], axis=-1)
+    alfa_rel = alfa_abs / trapezoid(pxx[..., m_t], f[m_t], axis=-1)
+
+    bloque = np.full(len(t_c), np.nan)
+    condicion = np.full(len(t_c), None, dtype=object)
+    dentro = np.zeros(len(t_c), bool)
+    for _, bl in bloques.iterrows():
+        en = (t_c >= bl["inicio_s"]) & (t_c < bl["fin_s"])
+        bloque[en], condicion[en] = bl["bloque"], bl["condicion"]
+        dentro |= (t_ini >= bl["inicio_s"] + cfg["recorte_transicion_s"]) & (t_fin <= bl["fin_s"])
+
+    valida = np.ones(len(t_c), bool)
+    if cfg["excluir_artefactos"]:
+        for on, du, de in zip(raw.annotations.onset, raw.annotations.duration,
+                              raw.annotations.description):
+            if de.upper().startswith("BAD"):
+                valida &= ~((t_ini < on + du) & (t_fin > on))
+
+    nc = len(canales)
+    df = pd.DataFrame({
+        "t_s": np.tile(t_c, nc),
+        "bloque": np.tile(bloque, nc),
+        "condicion": np.tile(condicion, nc),
+        "canal": np.repeat(canales, len(t_c)),
+        "alfa_abs": alfa_abs.ravel(),
+        "alfa_rel": alfa_rel.ravel(),
+        "dentro": np.tile(dentro, nc),
+    })
+    df = df[np.tile(valida, nc)].reset_index(drop=True)
+    df["bloque"] = df["bloque"].astype("Int64")
+    return df
 
 
 def resumen_por_bloque(df: pd.DataFrame) -> pd.DataFrame:
-    """Media, desviación y razón EC/EO por bloque a partir de potencia_alfa().
+    """Una fila por bloque a partir de ``potencia_alfa()``.
 
-    Pendiente (C).
+    Usa solo ventanas ``dentro``. Promedia entre canales en cada ventana y luego
+    resume las ventanas del bloque.
+
+    Columnas: bloque, condicion, n_ventanas, alfa_abs_media, alfa_abs_de,
+    alfa_rel_media, alfa_rel_de, par (EC con el EO siguiente: 1-2, 3-4, …),
+    razon_ec_eo_abs, razon_ec_eo_rel (razón de medias dentro del par).
     """
-    raise NotImplementedError("C: resumen_por_bloque() pendiente")
+    d = df[df["dentro"]] if "dentro" in df else df.dropna(subset=["bloque"])
+    por_ventana = (d.groupby(["bloque", "condicion", "t_s"], as_index=False)
+                     [["alfa_abs", "alfa_rel"]].mean())
+    res = (por_ventana.groupby(["bloque", "condicion"])
+           .agg(n_ventanas=("t_s", "size"),
+                alfa_abs_media=("alfa_abs", "mean"), alfa_abs_de=("alfa_abs", "std"),
+                alfa_rel_media=("alfa_rel", "mean"), alfa_rel_de=("alfa_rel", "std"))
+           .reset_index())
+    res["par"] = (res["bloque"] + 1) // 2
+    for m in ["abs", "rel"]:
+        piv = res.pivot(index="par", columns="condicion", values=f"alfa_{m}_media")
+        res[f"razon_ec_eo_{m}"] = res["par"].map(piv["EC"] / piv["EO"])
+    return res
