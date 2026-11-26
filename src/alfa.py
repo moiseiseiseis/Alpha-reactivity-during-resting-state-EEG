@@ -23,6 +23,7 @@ from pathlib import Path
 import mne
 import numpy as np
 import pandas as pd
+from scipy.signal import freqz
 
 # ---------------------------------------------------------------------------
 # Parámetros del análisis
@@ -33,8 +34,10 @@ CONFIG = {
     # (inferiores, sobre musculatura del cuello) ni la fila P (menos reactiva).
     "canales": ["O1", "Oz", "O2", "PO7", "PO3", "POz", "PO4", "PO8"],
     "banda_alfa": (8.0, 13.0),
-    # Provisional: B decide y justifica antes del 19 nov.
-    "filtro": {"l_freq": 1.0, "h_freq": 40.0, "notch": 50.0},
+    # B (notebook 02): FIR de fase cero, pasa-banda 1-40 Hz. El notch de 50 Hz es redundante
+    # (el pasa-bajas ya atenua >80 dB en 50 Hz); poner 50.0 solo si la celda de decision
+    # del notebook 02 (seccion 2) dice NECESARIO.
+    "filtro": {"l_freq": 1.0, "h_freq": 40.0, "notch": None},
     "sfreq_analisis": 250,
     "ventana_s": 2.0,
     "solapamiento": 0.5,          # fracción de la ventana (0.5 = 50 %)
@@ -350,30 +353,170 @@ def resumen_artefactos(raw: mne.io.Raw, bloques: pd.DataFrame) -> pd.DataFrame:
 # Carril B · Acondicionamiento (Adrián)
 # ---------------------------------------------------------------------------
 
+# Diseño FIR común a todos los filtros del carril B: fase cero (sin distorsión de
+# fase ni retardo, importante para comparar tiempos de transición EO/EC),
+# ventana Hamming y diseño firwin.
+_FIR = dict(method="fir", phase="zero", fir_window="hamming", fir_design="firwin")
+
+
+def _validar_filtro(cfg: dict, sfreq_in: float) -> None:
+    """Revisa que cfg['filtro'] y cfg['sfreq_analisis'] sean coherentes con el registro."""
+    f = cfg["filtro"]
+    l_freq, h_freq, notch = f.get("l_freq"), f.get("h_freq"), f.get("notch")
+    sfreq_out = cfg["sfreq_analisis"]
+    if l_freq is None and h_freq is None:
+        raise ValueError("cfg['filtro'] necesita l_freq y/o h_freq")
+    if l_freq is not None and h_freq is not None and l_freq >= h_freq:
+        raise ValueError(f"l_freq ({l_freq}) debe ser menor que h_freq ({h_freq})")
+    if sfreq_out > sfreq_in:
+        raise ValueError(f"sfreq_analisis ({sfreq_out}) > sfreq del registro ({sfreq_in}): no se sobremuestrea")
+    if h_freq is not None and h_freq >= sfreq_out / 2:
+        raise ValueError(f"h_freq ({h_freq}) debe ser < Nyquist de salida ({sfreq_out / 2})")
+    if notch is not None and notch >= sfreq_in / 2:
+        raise ValueError(f"notch ({notch}) debe ser < Nyquist del registro ({sfreq_in / 2})")
+
+
 def acondicionar(raw: mne.io.Raw, cfg: dict | None = None) -> mne.io.Raw:
     """Devuelve una copia filtrada y remuestreada según cfg['filtro'] y cfg['sfreq_analisis'].
 
-    Pendiente (B). No modifica ``raw``.
+    Cadena (a la frecuencia de muestreo original, antes de remuestrear, para que el
+    pasa-bajas actúe como antialiasing):
+
+    1. Pasa-banda FIR de fase cero (``l_freq``-``h_freq``) en canales EEG y EOG.
+    2. Notch FIR de fase cero en ``cfg['filtro']['notch']`` si no es None.
+    3. Remuestreo a ``cfg['sfreq_analisis']`` (si difiere de la frecuencia original).
+
+    No modifica ``raw``. Conserva las anotaciones (bloques, ``BAD_``) y todos los canales.
     """
-    raise NotImplementedError("B: acondicionar() pendiente")
+    cfg = CONFIG if cfg is None else cfg
+    f = cfg["filtro"]
+    sfreq_in = float(raw.info["sfreq"])
+    sfreq_out = cfg["sfreq_analisis"]
+    _validar_filtro(cfg, sfreq_in)
+
+    out = raw.copy().load_data()
+    picks = mne.pick_types(out.info, eeg=True, eog=True, exclude=[])  # EEG + VEOG
+
+    out.filter(l_freq=f.get("l_freq"), h_freq=f.get("h_freq"), picks=picks, verbose=False, **_FIR)
+    if f.get("notch") is not None:
+        out.notch_filter(freqs=f["notch"], picks=picks, verbose=False, **_FIR)
+    if float(sfreq_out) != sfreq_in:
+        out.resample(sfreq_out, verbose=False)
+    return out
+
+
+def respuesta_filtro(sfreq: float, cfg: dict | None = None, n_puntos: int = 2 ** 16):
+    """Respuesta en frecuencia del pasa-banda de ``acondicionar`` (sin el notch).
+
+    Devuelve ``(freqs_hz, magnitud_db, h)``, con ``h`` el kernel FIR. ``sfreq`` es la
+    frecuencia a la que se filtra (la del registro original). Al ser de fase cero, el
+    retardo de grupo es 0 s y la magnitud es la que se aplica a la señal.
+    """
+    cfg = CONFIG if cfg is None else cfg
+    f = cfg["filtro"]
+    h = mne.filter.create_filter(None, sfreq, f.get("l_freq"), f.get("h_freq"), verbose=False, **_FIR)
+    freqs, H = freqz(h, worN=n_puntos, fs=sfreq)
+    mag_db = 20.0 * np.log10(np.maximum(np.abs(H), 1e-12))
+    return freqs, mag_db, h
 
 
 # ---------------------------------------------------------------------------
 # Carril C · Caracterización del alfa (Diego)
 # ---------------------------------------------------------------------------
 
-def potencia_alfa(raw: mne.io.Raw, bloques: pd.DataFrame, cfg: dict | None = None) -> pd.DataFrame:
-    """Potencia alfa por ventana y canal (PSD de Welch).
+import numpy as np
+from numpy.lib.stride_tricks import sliding_window_view
+from scipy.integrate import trapezoid
+from scipy.signal import welch
 
-    Columnas: t_s, bloque, condicion, canal, alfa_abs, alfa_rel.
-    Pendiente (C).
+def potencia_alfa(raw: mne.io.Raw, bloques: pd.DataFrame, cfg: dict | None = None) -> pd.DataFrame:
+    """Potencia alfa por ventana deslizante y canal (PSD de Welch, un segmento por ventana).
+
+    Ventanas de ``cfg['ventana_s']`` con traslape ``cfg['solapamiento']`` sobre todo el
+    registro (también transiciones, para la curva temporal).
+
+    Columnas:
+        t_s        centro de la ventana (s)
+        bloque     bloque al que pertenece el centro (NA fuera de bloques)
+        condicion  'EO' / 'EC' (None fuera de bloques)
+        canal      nombre del canal (cfg['canales'])
+        alfa_abs   potencia en cfg['banda_alfa'] (µV², área bajo la PSD)
+        alfa_rel   alfa_abs / potencia en la banda del filtro (l_freq–h_freq)
+        dentro     True si la ventana cae completa en [inicio + recorte, fin] de un bloque
+
+    Si ``cfg['excluir_artefactos']``, se descartan las ventanas que se traslapan con
+    anotaciones 'BAD_...'.
     """
-    raise NotImplementedError("C: potencia_alfa() pendiente")
+    cfg = CONFIG if cfg is None else cfg
+    sf = raw.info["sfreq"]
+    canales = cfg["canales"]
+    n_win = int(round(cfg["ventana_s"] * sf))
+    paso = max(1, int(round(n_win * (1 - cfg["solapamiento"]))))
+
+    x = raw.get_data(picks=canales) * 1e6                          # V → µV
+    seg = sliding_window_view(x, n_win, axis=1)[:, ::paso, :]       # (canales, ventanas, muestras)
+    t_ini = np.arange(seg.shape[1]) * paso / sf
+    t_fin = t_ini + n_win / sf
+    t_c = (t_ini + t_fin) / 2
+
+    f, pxx = welch(seg, fs=sf, nperseg=n_win, axis=-1)              # µV²/Hz
+    a, b = cfg["banda_alfa"]
+    lo = cfg["filtro"].get("l_freq") or f[1]
+    hi = cfg["filtro"].get("h_freq") or sf / 2
+    m_a, m_t = (f >= a) & (f <= b), (f >= lo) & (f <= hi)
+    alfa_abs = trapezoid(pxx[..., m_a], f[m_a], axis=-1)
+    alfa_rel = alfa_abs / trapezoid(pxx[..., m_t], f[m_t], axis=-1)
+
+    bloque = np.full(len(t_c), np.nan)
+    condicion = np.full(len(t_c), None, dtype=object)
+    dentro = np.zeros(len(t_c), bool)
+    for _, bl in bloques.iterrows():
+        en = (t_c >= bl["inicio_s"]) & (t_c < bl["fin_s"])
+        bloque[en], condicion[en] = bl["bloque"], bl["condicion"]
+        dentro |= (t_ini >= bl["inicio_s"] + cfg["recorte_transicion_s"]) & (t_fin <= bl["fin_s"])
+
+    valida = np.ones(len(t_c), bool)
+    if cfg["excluir_artefactos"]:
+        for on, du, de in zip(raw.annotations.onset, raw.annotations.duration,
+                              raw.annotations.description):
+            if de.upper().startswith("BAD"):
+                valida &= ~((t_ini < on + du) & (t_fin > on))
+
+    nc = len(canales)
+    df = pd.DataFrame({
+        "t_s": np.tile(t_c, nc),
+        "bloque": np.tile(bloque, nc),
+        "condicion": np.tile(condicion, nc),
+        "canal": np.repeat(canales, len(t_c)),
+        "alfa_abs": alfa_abs.ravel(),
+        "alfa_rel": alfa_rel.ravel(),
+        "dentro": np.tile(dentro, nc),
+    })
+    df = df[np.tile(valida, nc)].reset_index(drop=True)
+    df["bloque"] = df["bloque"].astype("Int64")
+    return df
 
 
 def resumen_por_bloque(df: pd.DataFrame) -> pd.DataFrame:
-    """Media, desviación y razón EC/EO por bloque a partir de potencia_alfa().
+    """Una fila por bloque a partir de ``potencia_alfa()``.
 
-    Pendiente (C).
+    Usa solo ventanas ``dentro``. Promedia entre canales en cada ventana y luego
+    resume las ventanas del bloque.
+
+    Columnas: bloque, condicion, n_ventanas, alfa_abs_media, alfa_abs_de,
+    alfa_rel_media, alfa_rel_de, par (EC con el EO siguiente: 1-2, 3-4, …),
+    razon_ec_eo_abs, razon_ec_eo_rel (razón de medias dentro del par).
     """
-    raise NotImplementedError("C: resumen_por_bloque() pendiente")
+    d = df[df["dentro"]] if "dentro" in df else df.dropna(subset=["bloque"])
+    por_ventana = (d.groupby(["bloque", "condicion", "t_s"], as_index=False)
+                     [["alfa_abs", "alfa_rel"]].mean())
+    res = (por_ventana.groupby(["bloque", "condicion"])
+           .agg(n_ventanas=("t_s", "size"),
+                alfa_abs_media=("alfa_abs", "mean"), alfa_abs_de=("alfa_abs", "std"),
+                alfa_rel_media=("alfa_rel", "mean"), alfa_rel_de=("alfa_rel", "std"))
+           .reset_index())
+    res["par"] = (res["bloque"] + 1) // 2
+    for m in ["abs", "rel"]:
+        piv = res.pivot(index="par", columns="condicion", values=f"alfa_{m}_media")
+        res[f"razon_ec_eo_{m}"] = res["par"].map(piv["EC"] / piv["EO"])
+    return res
