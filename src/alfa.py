@@ -23,7 +23,9 @@ from pathlib import Path
 import mne
 import numpy as np
 import pandas as pd
-from scipy.signal import freqz
+from numpy.lib.stride_tricks import sliding_window_view
+from scipy.integrate import trapezoid
+from scipy.signal import freqz, welch
 
 # ---------------------------------------------------------------------------
 # Parámetros del análisis
@@ -423,11 +425,6 @@ def respuesta_filtro(sfreq: float, cfg: dict | None = None, n_puntos: int = 2 **
 # ---------------------------------------------------------------------------
 # Carril C · Caracterización del alfa (Diego)
 # ---------------------------------------------------------------------------
-
-import numpy as np
-from numpy.lib.stride_tricks import sliding_window_view
-from scipy.integrate import trapezoid
-from scipy.signal import welch
 
 def potencia_alfa(raw: mne.io.Raw, bloques: pd.DataFrame, cfg: dict | None = None) -> pd.DataFrame:
     """Potencia alfa por ventana deslizante y canal (PSD de Welch, un segmento por ventana).
