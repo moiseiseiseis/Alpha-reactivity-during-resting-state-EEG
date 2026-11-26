@@ -2,6 +2,7 @@
 
 Correr desde la raíz del repo:  python -m pytest -q
 """
+import copy
 import sys
 from pathlib import Path
 
@@ -70,9 +71,11 @@ def test_sin_marcadores_de_condicion():
 
 
 def test_variante_no_modifica_config():
-    v = alfa.variante(ventana_s=10.0, filtro={"notch": None})
-    assert v["ventana_s"] == 10.0 and v["filtro"]["notch"] is None
-    assert alfa.CONFIG["ventana_s"] == 2.0 and alfa.CONFIG["filtro"]["notch"] == 50.0
+    antes = copy.deepcopy(alfa.CONFIG)
+    v = alfa.variante(ventana_s=99.0, filtro={"notch": 60.0})
+    assert v["ventana_s"] == 99.0 and v["filtro"]["notch"] == 60.0
+    assert v["filtro"]["l_freq"] == antes["filtro"]["l_freq"]  # el resto del dict anidado se conserva
+    assert alfa.CONFIG == antes
     with pytest.raises(KeyError):
         alfa.variante(no_existe=1)
 
