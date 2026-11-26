@@ -21,6 +21,7 @@ import sys
 from pathlib import Path
 
 import mne
+import numpy as np
 import pandas as pd
 
 # ---------------------------------------------------------------------------
@@ -28,8 +29,9 @@ import pandas as pd
 # ---------------------------------------------------------------------------
 
 CONFIG = {
-    # A justifica la lista final (distribución occipito-parietal del alfa).
-    "canales": ["P3", "Pz", "P4", "PO9", "O1", "Oz", "O2", "PO10"],
+    # A (notebook 01, §4): occipitales y parieto-occipitales, simétricos. Sin PO9/PO10
+    # (inferiores, sobre musculatura del cuello) ni la fila P (menos reactiva).
+    "canales": ["O1", "Oz", "O2", "PO7", "PO3", "POz", "PO4", "PO8"],
     "banda_alfa": (8.0, 13.0),
     # Provisional: B decide y justifica antes del 19 nov.
     "filtro": {"l_freq": 1.0, "h_freq": 40.0, "notch": 50.0},
@@ -38,6 +40,14 @@ CONFIG = {
     "solapamiento": 0.5,          # fracción de la ventana (0.5 = 50 %)
     "recorte_transicion_s": 5.0,  # s descartados después de cada cambio de condición
     "excluir_artefactos": True,   # usa anotaciones BAD_ con reject_by_annotation
+    # A (notebook 01, §5): criterio de marcar_artefactos().
+    "artefactos": {
+        "umbral_pp_uv": 100.0,     # pico a pico por segmento en algún canal de análisis (1-40 Hz)
+        "segmento_s": 1.0,         # resolución del marcado por amplitud
+        "plano_pp_uv": 1.0,        # por debajo: canal plano o desconectado
+        "parpadeos": True,         # marca BAD_parpadeo alrededor de cada evento del VEOG
+        "margen_parpadeo_s": 0.4,  # s antes y después del pico del parpadeo
+    },
 }
 
 ARCHIVO_VHDR = "sub-010002_task-resting_eeg.vhdr"
@@ -217,12 +227,123 @@ def tabla_bloques(raw: mne.io.Raw) -> pd.DataFrame:
     return pd.DataFrame(filas)
 
 
-def marcar_artefactos(raw: mne.io.Raw, cfg: dict | None = None) -> mne.io.Raw:
-    """Agrega anotaciones 'BAD_...' sobre los segmentos con artefactos.
+def marcar_artefactos(raw: mne.io.Raw, cfg: dict | None = None, csv_manual="auto") -> mne.io.Raw:
+    """Agrega anotaciones 'BAD_...' sobre los segmentos con artefactos y devuelve ``raw``.
 
-    Pendiente (A).
+    Modifica las anotaciones de ``raw`` (no la señal). Si ya tenía anotaciones
+    'BAD_', se quitan antes, así la función se puede volver a correr con otro cfg.
+    Criterios (parámetros en ``cfg['artefactos']``):
+
+    - ``BAD_amplitud``: en segmentos de ``segmento_s``, algún canal de
+      ``cfg['canales']`` supera ``umbral_pp_uv`` de pico a pico. Se mide sobre una
+      copia filtrada con ``cfg['filtro']`` (l_freq-h_freq) para que la deriva lenta
+      no dispare el umbral.
+    - ``BAD_plano``: algún canal de análisis tiene menos de ``plano_pp_uv`` en el segmento.
+    - ``BAD_parpadeo``: ±``margen_parpadeo_s`` alrededor de cada evento que
+      ``mne.preprocessing.find_eog_events`` detecta en VEOG (si ``parpadeos``).
+    - ``BAD_manual``: filas de ``csv_manual`` (columnas ``inicio_s, fin_s, motivo``).
+      Con ``"auto"`` se usa ``resultados/segmentos_malos_manual.csv`` si existe.
+
+    ``potencia_alfa`` descarta las ventanas que tocan estas anotaciones cuando
+    ``cfg['excluir_artefactos']`` es True.
     """
-    raise NotImplementedError("A: marcar_artefactos() pendiente")
+    cfg = CONFIG if cfg is None else cfg
+    pa = cfg["artefactos"]
+    sf = raw.info["sfreq"]
+    offset = raw.first_time if raw.annotations.orig_time is not None else 0.0
+
+    # Copia ligera: solo canales de análisis (+ VEOG), filtrada.
+    picks = [c for c in cfg["canales"] if c in raw.ch_names]
+    if len(picks) != len(cfg["canales"]):
+        faltan = sorted(set(cfg["canales"]) - set(picks))
+        raise ValueError(f"Canales de cfg['canales'] que no están en raw: {faltan}")
+    tiene_veog = "VEOG" in raw.ch_names
+    tmp = raw.copy().pick(picks + (["VEOG"] if tiene_veog else [])).load_data()
+    tmp.filter(cfg["filtro"].get("l_freq"), cfg["filtro"].get("h_freq"),
+               picks="all", verbose=False)
+
+    onsets, durs, descs = [], [], []
+
+    # Amplitud y canal plano, por segmentos.
+    x = tmp.get_data(picks=picks) * 1e6
+    n = int(round(pa["segmento_s"] * sf))
+    nseg = x.shape[1] // n
+    pp = np.ptp(x[:, : nseg * n].reshape(len(picks), nseg, n), axis=2)  # (canales, segmentos)
+    for desc, malo in [("BAD_amplitud", (pp > pa["umbral_pp_uv"]).any(axis=0)),
+                       ("BAD_plano", (pp < pa["plano_pp_uv"]).any(axis=0))]:
+        for ini, fin in _rachas(malo):
+            onsets.append(ini * n / sf)
+            durs.append((fin - ini) * n / sf)
+            descs.append(desc)
+
+    # Parpadeos (VEOG).
+    if pa["parpadeos"] and tiene_veog:
+        ev = mne.preprocessing.find_eog_events(tmp, ch_name="VEOG", verbose=False)
+        for muestra in ev[:, 0]:
+            t = (muestra - tmp.first_samp) / sf
+            onsets.append(max(0.0, t - pa["margen_parpadeo_s"]))
+            durs.append(2 * pa["margen_parpadeo_s"])
+            descs.append("BAD_parpadeo")
+
+    # Segmentos anotados a mano en el recorrido visual.
+    if isinstance(csv_manual, str) and csv_manual == "auto":
+        csv_manual = rutas()["resultados"] / "segmentos_malos_manual.csv"
+    if csv_manual is not None and Path(csv_manual).exists():
+        man = pd.read_csv(csv_manual)
+        for fila in man.itertuples():
+            onsets.append(float(fila.inicio_s))
+            durs.append(float(fila.fin_s) - float(fila.inicio_s))
+            descs.append("BAD_manual")
+
+    viejas = raw.annotations
+    conservar = [i for i, d in enumerate(viejas.description) if not d.upper().startswith("BAD")]
+    nuevas = mne.Annotations(
+        onset=list(viejas.onset[conservar]) + [o + offset for o in onsets],
+        duration=list(viejas.duration[conservar]) + durs,
+        description=list(viejas.description[conservar]) + descs,
+        orig_time=viejas.orig_time,
+    )
+    raw.set_annotations(nuevas)
+    return raw
+
+
+def _rachas(mascara) -> list[tuple[int, int]]:
+    """Índices [inicio, fin) de cada racha de True consecutivos."""
+    m = np.concatenate([[False], np.asarray(mascara, bool), [False]])
+    cambios = np.flatnonzero(m[1:] != m[:-1])
+    return list(zip(cambios[::2], cambios[1::2]))
+
+
+def resumen_artefactos(raw: mne.io.Raw, bloques: pd.DataFrame) -> pd.DataFrame:
+    """Segundos marcados como 'BAD_' por tipo y condición.
+
+    Para la tabla de calidad del notebook 01 y del informe. Las anotaciones de un
+    mismo tipo que se traslapan se cuentan una sola vez; la fila 'cualquiera' une
+    todos los tipos.
+    """
+    sf = raw.info["sfreq"]
+    t = raw.times
+    offset = raw.first_time if raw.annotations.orig_time is not None else 0.0
+    cond = np.full(len(t), "fuera", dtype=object)
+    for b in bloques.itertuples():
+        cond[(t >= b.inicio_s) & (t < b.fin_s)] = b.condicion
+    ann = raw.annotations
+    tipos = sorted({d for d in ann.description if d.upper().startswith("BAD")})
+    filas = []
+    for tipo in tipos + ["cualquiera"]:
+        malo = np.zeros(len(t), bool)
+        for on, du, de in zip(ann.onset, ann.duration, ann.description):
+            if de == tipo or (tipo == "cualquiera" and de.upper().startswith("BAD")):
+                malo |= (t >= on - offset) & (t < on - offset + du)
+        fila = {"tipo": tipo}
+        for c in ["EC", "EO", "fuera"]:
+            fila[f"{c}_s"] = round(malo[cond == c].sum() / sf, 1)
+        filas.append(fila)
+    res = pd.DataFrame(filas)
+    for c in ["EC", "EO"]:
+        total = (cond == c).sum() / sf
+        res[f"{c}_pct"] = (100 * res[f"{c}_s"] / total).round(1)
+    return res
 
 
 # ---------------------------------------------------------------------------

@@ -83,3 +83,54 @@ def test_variante_no_modifica_config():
 def test_cargar_raw_ruta_inexistente(tmp_path):
     with pytest.raises(FileNotFoundError):
         alfa.cargar_raw(tmp_path / "no_existe.vhdr")
+
+
+def raw_para_artefactos(sfreq=250.0, dur=60.0, seed=0):
+    """2 canales con ruido de 10 µV (sin artefactos) y marcadores de 1 bloque EC."""
+    rng = np.random.default_rng(seed)
+    info = mne.create_info(["O1", "O2"], sfreq, "eeg")
+    x = rng.normal(0, 10e-6, (2, int(dur * sfreq)))
+    raw = mne.io.RawArray(x, info, verbose="ERROR")
+    raw.set_annotations(mne.Annotations([1.0], [0.0004], ["Stimulus/S  4"]))
+    return raw
+
+
+def cfg_artefactos():
+    return alfa.variante(canales=["O1", "O2"], artefactos={"parpadeos": False})
+
+
+def test_marcar_artefactos_detecta_un_salto_de_amplitud():
+    raw = raw_para_artefactos()
+    sf = raw.info["sfreq"]
+    raw._data[0, int(30.2 * sf):int(30.4 * sf)] += 300e-6  # escalón de 300 µV en O1
+    alfa.marcar_artefactos(raw, cfg_artefactos(), csv_manual=None)
+    bad = [(a["onset"], a["duration"]) for a in raw.annotations if a["description"] == "BAD_amplitud"]
+    assert bad, "no marcó el salto"
+    assert all(29.0 <= on and on + du <= 32.0 for on, du in bad)
+    assert "Stimulus/S  4" in raw.annotations.description  # conserva los marcadores
+
+
+def test_marcar_artefactos_senal_limpia_y_reejecucion():
+    raw = raw_para_artefactos()
+    cfg = cfg_artefactos()
+    alfa.marcar_artefactos(raw, cfg, csv_manual=None)
+    assert not any(d.startswith("BAD") for d in raw.annotations.description)
+    raw._data[1, :] = 0.0  # O2 plano
+    alfa.marcar_artefactos(raw, cfg, csv_manual=None)
+    alfa.marcar_artefactos(raw, cfg, csv_manual=None)  # correr dos veces no duplica
+    planos = [d for d in raw.annotations.description if d == "BAD_plano"]
+    assert len(planos) == 1
+
+
+def test_marcar_artefactos_csv_manual(tmp_path):
+    raw = raw_para_artefactos()
+    csv = tmp_path / "malos.csv"
+    csv.write_text("inicio_s,fin_s,canales,motivo\n10.0,12.5,O1,movimiento\n", encoding="utf-8")
+    alfa.marcar_artefactos(raw, cfg_artefactos(), csv_manual=csv)
+    man = [(a["onset"], a["duration"]) for a in raw.annotations if a["description"] == "BAD_manual"]
+    assert man == [(pytest.approx(10.0), pytest.approx(2.5))]
+
+
+def test_marcar_artefactos_canal_inexistente():
+    with pytest.raises(ValueError):
+        alfa.marcar_artefactos(raw_para_artefactos(), alfa.variante(canales=["Pz"]), csv_manual=None)
